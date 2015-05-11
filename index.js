@@ -1,4 +1,3 @@
-
 /**
  * Module dependencies.
  */
@@ -9,7 +8,6 @@ var msgpack = require('msgpack-js');
 var Adapter = require('socket.io-adapter');
 var Emitter = require('events').EventEmitter;
 var debug = require('debug')('socket.io-redis');
-var async = require('async');
 
 /**
  * Module exports.
@@ -42,6 +40,7 @@ function adapter(uri, opts){
   }
 
   // opts
+  var socket = opts.socket;
   var host = opts.host || '127.0.0.1';
   var port = Number(opts.port || 6379);
   var pub = opts.pubClient;
@@ -49,11 +48,15 @@ function adapter(uri, opts){
   var prefix = opts.key || 'socket.io';
 
   // init clients if needed
-  if (!pub) pub = redis(port, host);
-  if (!sub) sub = redis(port, host, { detect_buffers: true });
+  if (!pub) pub = socket ? redis(socket) : redis(port, host);
+  if (!sub) sub = socket
+    ? redis(socket, { detect_buffers: true })
+    : redis(port, host, {detect_buffers: true});
+
 
   // this server's key
   var uid = uid2(6);
+  var key = prefix + '#' + uid;
 
   /**
    * Adapter constructor.
@@ -64,16 +67,9 @@ function adapter(uri, opts){
 
   function Redis(nsp){
     Adapter.call(this, nsp);
+    this.channels = [];
 
-    this.uid = uid;
-    this.prefix = prefix;
-    this.pubClient = pub;
-    this.subClient = sub;
-
-    var self = this;
-    sub.subscribe(prefix + '#' + nsp.name + '#', function(err){
-      if (err) self.emit('error', err);
-    });
+    this.subscribe('entire-notice');
     sub.on('message', this.onmessage.bind(this));
   }
 
@@ -83,6 +79,22 @@ function adapter(uri, opts){
 
   Redis.prototype.__proto__ = Adapter.prototype;
 
+  Redis.prototype.subscribe = function(channel){
+    if(this.channels.indexOf(channel) == -1){
+      this.channels.push(channel);
+      sub.subscribe(channel);
+    }
+
+  };
+
+  Redis.prototype.unsubscribe = function(channel){
+    var index = this.channels.indexOf(channel);
+    if(index > -1){
+      this.channels.splice(index, 1);
+      sub.unsubscribe(channel);
+    }
+  };
+  
   /**
    * Called with a subscription message
    *
@@ -90,21 +102,18 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.onmessage = function(channel, msg){
+    var pieces = channel.split('#');
+    // if (uid == pieces.pop()) return debug('ignore same uid');
     var args = msgpack.decode(msg);
-    var packet;
 
-    if (uid == args.shift()) return debug('ignore same uid');
-
-    packet = args[0];
-
-    if (packet && packet.nsp === undefined) {
-      packet.nsp = '/';
+    if (args[0] && args[0].nsp === undefined) {
+      args[0].nsp = '/';
     }
 
-    if (!packet || packet.nsp != this.nsp.name) {
+    if (!args[0] || args[0].nsp != this.nsp.name) {
       return debug('ignore different namespace');
     }
-
+    
     args.push(true);
 
     this.broadcast.apply(this, args);
@@ -120,129 +129,10 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.broadcast = function(packet, opts, remote){
-    Adapter.prototype.broadcast.call(this, packet, opts);
-    if (!remote) {
-      if (opts.rooms) {
-        opts.rooms.forEach(function(room) {
-          var chn = prefix + '#' + packet.nsp + '#' + room + '#';
-          var msg = msgpack.encode([uid, packet, opts]);
-          pub.publish(chn, msg);
-        });
-      } else {
-        var chn = prefix + '#' + packet.nsp + '#';
-        var msg = msgpack.encode([uid, packet, opts]);
-        pub.publish(chn, msg);
-      }
-    }
+    var room = packet.data[1].room;
+    if (!remote) pub.publish(room, msgpack.encode([packet, opts]));
+    if (remote) Adapter.prototype.broadcast.call(this, packet, opts);
   };
-
-  /**
-   * Subscribe client to room messages.
-   *
-   * @param {String} client id
-   * @param {String} room
-   * @param {Function} callback (optional)
-   * @api public
-   */
-
-  Redis.prototype.add = function(id, room, fn){
-    debug('adding %s to %s ', id, room);
-    var self = this;
-    this.sids[id] = this.sids[id] || {};
-    this.sids[id][room] = true;
-    this.rooms[room] = this.rooms[room] || {};
-    this.rooms[room][id] = true;
-    var channel = prefix + '#' + this.nsp.name + '#' + room + '#';
-    sub.subscribe(channel, function(err){
-      if (err) {
-        self.emit('error', err);
-        if (fn) fn(err);
-        return;
-      }
-      if (fn) fn(null);
-    });
-  };
-
-  /**
-   * Unsubscribe client from room messages.
-   *
-   * @param {String} session id
-   * @param {String} room id
-   * @param {Function} callback (optional)
-   * @api public
-   */
-
-  Redis.prototype.del = function(id, room, fn){
-    debug('removing %s from %s', id, room);
-
-    var self = this;
-    this.sids[id] = this.sids[id] || {};
-    this.rooms[room] = this.rooms[room] || {};
-    delete this.sids[id][room];
-    delete this.rooms[room][id];
-
-    if (this.rooms.hasOwnProperty(room) && !Object.keys(this.rooms[room]).length) {
-      delete this.rooms[room];
-      var channel = prefix + '#' + this.nsp.name + '#' + room + '#';
-      sub.unsubscribe(channel, function(err){
-        if (err) {
-          self.emit('error', err);
-          if (fn) fn(err);
-          return;
-        }
-        if (fn) fn(null);
-      });
-    } else {
-      if (fn) process.nextTick(fn.bind(null, null));
-    }
-  };
-
-  /**
-   * Unsubscribe client completely.
-   *
-   * @param {String} client id
-   * @param {Function} callback (optional)
-   * @api public
-   */
-
-  Redis.prototype.delAll = function(id, fn){
-    debug('removing %s from all rooms', id);
-
-    var self = this;
-    var rooms = this.sids[id];
-
-    if (!rooms) return process.nextTick(fn.bind(null, null));
-
-    async.forEach(Object.keys(rooms), function(room, next){
-      if (rooms.hasOwnProperty(room)) {
-        delete self.rooms[room][id];
-      }
-
-      if (self.rooms.hasOwnProperty(room) && !Object.keys(self.rooms[room]).length) {
-        delete self.rooms[room];
-        var channel = prefix + '#' + self.nsp.name + '#' + room + '#';
-        return sub.unsubscribe(channel, function(err){
-          if (err) return self.emit('error', err);
-          next();
-        });
-      } else {
-        process.nextTick(next);
-      }
-    }, function(err){
-      if (err) {
-        self.emit('error', err);
-        if (fn) fn(err);
-        return;
-      }
-      delete self.sids[id];
-      if (fn) fn(null);
-    });
-  };
-
-  Redis.uid = uid;
-  Redis.pubClient = pub;
-  Redis.subClient = sub;
-  Redis.prefix = prefix;
 
   return Redis;
 
