@@ -129,11 +129,16 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.broadcast = function(packet, opts, remote){
-    var room = packet.data[1].room;
-    if (!remote) pub.publish(room, msgpack.encode([packet, opts]));
+    if (!remote) {
+      if (opts.rooms === undefined ){
+        Adapter.prototype.broadcast.call(this, packet, opts);
+      }else{
+        var room = packet.data[1].room;
+        pub.publish(room, msgpack.encode([packet, opts]));
+      }
+    };
     if (remote) Adapter.prototype.broadcast.call(this, packet, opts);
   };
 
   return Redis;
-
 }
