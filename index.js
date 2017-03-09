@@ -102,7 +102,6 @@ function adapter(uri, opts){
    */
 
   Redis.prototype.onmessage = function(channel, msg){
-    var pieces = channel.split('#');
     // if (uid == pieces.pop()) return debug('ignore same uid');
     var args = msgpack.decode(msg);
 
